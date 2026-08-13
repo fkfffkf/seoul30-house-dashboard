@@ -192,6 +192,22 @@ def build_market_snapshot(candidates_df, service_key):
 
 candidates = load_candidates()
 seed = load_seed_prices()
+
+# 이전 버전 CSV가 GitHub에 남아 있어도 앱이 죽지 않도록 호환 컬럼을 자동 생성합니다.
+_candidate_defaults = {
+    "candidate_rank": 99,
+    "static_data_status": "추가검증",
+    "api_name": "",
+    "screening": "TOP 후보",
+}
+for _col, _default in _candidate_defaults.items():
+    if _col not in candidates.columns:
+        candidates[_col] = _default
+if "api_name" in candidates.columns:
+    candidates["api_name"] = candidates["api_name"].fillna("")
+if "candidate_rank" in candidates.columns:
+    candidates["candidate_rank"] = pd.to_numeric(candidates["candidate_rank"], errors="coerce").fillna(99).astype(int)
+
 api_key = get_api_key()
 
 st.title("🏠 서울30평꿀집샀다")
