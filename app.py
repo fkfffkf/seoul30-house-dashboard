@@ -10,7 +10,9 @@ from urllib.parse import quote_plus
 st.set_page_config(page_title="서울30평꿀집샀다", page_icon="🏠", layout="wide")
 
 TARGET = 12.42
-MAX_BUDGET = 13.42
+WATCH_14 = 14.00
+WATCH_15 = 15.00
+MAX_BUDGET = 13.42  # 기존 자금계획상 MAX. 14/15억은 별도 확장 관찰선.
 AREA_MIN = 74
 AREA_MAX = 85
 
@@ -100,32 +102,93 @@ def filter_complex(df, complex_name):
 
 def price_status(price):
     if pd.isna(price): return "데이터 대기"
-    if price <= TARGET: return "적극검토"
-    if price <= MAX_BUDGET: return "경계"
-    return "예산초과"
+    if price <= TARGET: return "🎯 12.42억 이내"
+    if price <= MAX_BUDGET: return "🟢 기존 MAX 이내"
+    if price <= WATCH_14: return "🟡 14억 이내"
+    if price <= WATCH_15: return "🟠 15억 이내"
+    return "🔴 15억 초과"
+
+def budget_band(price):
+    if pd.isna(price): return "데이터 대기"
+    if price <= TARGET: return "12.42억"
+    if price <= WATCH_14: return "14억"
+    if price <= WATCH_15: return "15억"
+    return "15억 초과"
 
 def naver_land_search_url(row):
-    # 네이버페이 부동산의 단지 고유번호는 외부에서 안정적으로 자동수집하기 어려워
-    # 네이버 검색을 통해 해당 단지의 네이버부동산 결과로 연결한다.
     query = f"네이버페이 부동산 {row['complex_name']} {row['area']}"
     return "https://search.naver.com/search.naver?query=" + quote_plus(query)
 
 def trade_summary(df):
     if df.empty or "price_eok" not in df: return None
-    df = df.dropna(subset=["price_eok", "deal_date"])
+    df = df.dropna(subset=["price_eok", "deal_date"]).sort_values("deal_date")
     if df.empty: return None
-    latest = df.sort_values("deal_date", ascending=False).iloc[0]
-    now = pd.Timestamp.today()
-    def median_since(months):
-        x = df[df.deal_date >= now - pd.DateOffset(months=months)]
-        return x.price_eok.median() if len(x) else None
-    m3, m12 = median_since(3), median_since(12)
+    latest = df.iloc[-1]
+    previous = df.iloc[-2] if len(df) >= 2 else None
+    now = pd.Timestamp.today().normalize()
+
+    recent3 = df[df.deal_date >= now - pd.DateOffset(months=3)]
+    prior3 = df[(df.deal_date < now - pd.DateOffset(months=3)) &
+                (df.deal_date >= now - pd.DateOffset(months=6))]
+    last12 = df[df.deal_date >= now - pd.DateOffset(months=12)]
+    recent7 = df[df.deal_date >= now - pd.Timedelta(days=7)]
+
+    m3 = recent3.price_eok.median() if len(recent3) else None
+    p3 = prior3.price_eok.median() if len(prior3) else None
+    median_change = (m3 - p3) if m3 is not None and p3 is not None else None
+    median_pct = (median_change / p3 * 100) if median_change is not None and p3 else None
+    latest_change = (float(latest.price_eok) - float(previous.price_eok)) if previous is not None else None
+    latest_pct = (latest_change / float(previous.price_eok) * 100) if latest_change is not None and float(previous.price_eok) else None
+
     return {
-        "latest": float(latest.price_eok), "latest_date": latest.deal_date.date(),
-        "m3": None if pd.isna(m3) else float(m3), "m12": None if pd.isna(m12) else float(m12),
-        "count3": int((df.deal_date >= now - pd.DateOffset(months=3)).sum()),
-        "count12": int((df.deal_date >= now - pd.DateOffset(months=12)).sum()),
+        "latest": float(latest.price_eok),
+        "latest_date": latest.deal_date.date(),
+        "previous": None if previous is None else float(previous.price_eok),
+        "latest_change": latest_change,
+        "latest_pct": latest_pct,
+        "m3": None if pd.isna(m3) else float(m3),
+        "prior3": None if pd.isna(p3) else float(p3),
+        "median_change": median_change,
+        "median_pct": median_pct,
+        "count3": int(len(recent3)),
+        "count12": int(len(last12)),
+        "count7": int(len(recent7)),
+        "high_5y": float(df.price_eok.max()) if len(df) else None,
     }
+
+def crossed_below(current, previous, threshold):
+    return current is not None and previous is not None and current <= threshold < previous
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def build_market_snapshot(candidates_df, service_key):
+    """최근 12개월을 법정동 코드별 1회씩 조회해 전체 후보의 현재 상태를 만든다."""
+    if not service_key:
+        return pd.DataFrame()
+    frames = []
+    for lawd in candidates_df["lawd_cd"].dropna().astype(str).unique():
+        all_trades = fetch_recent_trades(lawd, 12, service_key)
+        subset = candidates_df[candidates_df["lawd_cd"].astype(str) == lawd]
+        for _, row in subset.iterrows():
+            if "후보" in str(row["complex_name"]):
+                continue
+            api_name = row["api_name"] if "api_name" in row and pd.notna(row["api_name"]) and str(row["api_name"]).strip() else row["complex_name"]
+            t = filter_complex(all_trades, api_name)
+            s = trade_summary(t)
+            if not s:
+                continue
+            frames.append({
+                "region": row["region"], "area": row["area"], "candidate_rank": row.get("candidate_rank", None),
+                "complex_name": row["complex_name"], "priority": row["priority"],
+                "latest": s["latest"], "latest_date": s["latest_date"],
+                "previous": s["previous"], "latest_change": s["latest_change"], "latest_pct": s["latest_pct"],
+                "m3": s["m3"], "prior3": s["prior3"], "median_change": s["median_change"],
+                "median_pct": s["median_pct"], "count3": s["count3"], "count12": s["count12"],
+                "count7": s["count7"], "band": budget_band(s["latest"]),
+                "cross_1242": crossed_below(s["latest"], s["previous"], TARGET),
+                "cross_14": crossed_below(s["latest"], s["previous"], WATCH_14),
+                "cross_15": crossed_below(s["latest"], s["previous"], WATCH_15),
+            })
+    return pd.DataFrame(frames)
 
 candidates = load_candidates()
 seed = load_seed_prices()
@@ -140,34 +203,91 @@ else:
     st.warning("현재는 DEMO 모드입니다. 공공데이터포털 인증키를 연결하면 최신 실거래가가 자동 갱신됩니다.")
 
 page = st.sidebar.radio("보기", ["전체 후보", "단지 상세", "지역 비교", "설정/사용법"])
-st.sidebar.markdown(f"**매수 기준**  TARGET {TARGET:.2f}억 · MAX {MAX_BUDGET:.2f}억")
+st.sidebar.markdown(f"**가격 관찰선**  🎯 {TARGET:.2f}억 · 🟡 {WATCH_14:.0f}억 · 🟠 {WATCH_15:.0f}억")
 st.sidebar.caption("전용 74~84㎡ 중심 · 500세대 이상 선호 · 역 도보 20분 이내 · 초중 인접")
 
 if page == "전체 후보":
     c1,c2,c3,c4 = st.columns(4)
-    c1.metric("등록 생활권/단지", len(candidates))
-    c2.metric("서울", int((candidates.region=="서울").sum()))
-    c3.metric("경기남부", int((candidates.region=="경기남부").sum()))
-    c4.metric("TARGET / MAX", f"{TARGET:.2f} / {MAX_BUDGET:.2f}억")
+    c1.metric("등록 후보 단지", len(candidates))
+    c2.metric("서울 생활권", candidates[candidates.region=="서울"]["area"].nunique())
+    c3.metric("경기남부 생활권", candidates[candidates.region=="경기남부"]["area"].nunique())
+    c4.metric("가격 관찰선", f"{TARGET:.2f} / 14 / 15억")
 
-    region_filter = st.multiselect("권역", ["서울","경기남부"], default=["서울","경기남부"])
-    pri_filter = st.multiselect("후보 상태", sorted(candidates.priority.unique()), default=list(sorted(candidates.priority.unique())))
-    view = candidates[candidates.region.isin(region_filter) & candidates.priority.isin(pri_filter)].copy()
-    view = view.merge(seed[["complex_name","low_2026","high_2026"]], on="complex_name", how="left")
-    view["seed_mid"] = (view.low_2026 + view.high_2026)/2
-    view["예산판정(초기값)"] = view.seed_mid.apply(price_status)
-    show_cols = ["region","area","complex_name","priority","screening","seed_mid","예산판정(초기값)","households","walk_station_min","nearest_station","commute_eulji_min","note"]
-    st.dataframe(view[show_cols].rename(columns={
-        "region":"권역","area":"생활권","complex_name":"단지","priority":"우선순위","screening":"스크리닝","seed_mid":"초기 대표가(억)",
-        "households":"세대수","walk_station_min":"역 도보(분)","nearest_station":"역","commute_eulji_min":"을지로 통근(분)","note":"메모"
-    }), use_container_width=True, hide_index=True)
-    st.caption("초기 대표가는 지금까지 대화에서 1차 검증한 값입니다. API 연결 후에는 최신 실거래가를 우선 표시합니다.")
+    st.markdown("#### 생활권별 TOP 후보 구성")
+    coverage = (candidates.groupby(["region","area"], as_index=False)
+                .agg(후보수=("complex_name","count"),
+                     기초검증완료=("static_data_status", lambda s: int((s=="기초검증").sum()))))
+    coverage["구성"] = coverage["후보수"].apply(lambda n: "TOP 5" if n >= 5 else f"TOP {n} (조건상 최대)")
+    st.dataframe(coverage.rename(columns={"region":"권역","area":"생활권"}),
+                 use_container_width=True, hide_index=True)
+    st.caption("생활권마다 최대 5개를 넣었습니다. 500세대·74~84㎡·역거리 조건을 억지로 완화해 숫자를 채우지는 않습니다.")
+
+    snapshot = pd.DataFrame()
+    if api_key:
+        with st.spinner("후보 단지의 최근 12개월 실거래를 확인하는 중..."):
+            snapshot = build_market_snapshot(candidates, api_key)
+
+    if not snapshot.empty:
+        st.subheader("🔥 지금 볼 만한 변화")
+        cheaper = snapshot[snapshot["median_change"].notna() & (snapshot["median_change"] < 0)].sort_values("median_pct")
+        t1242 = snapshot[snapshot["cross_1242"]]
+        t14 = snapshot[snapshot["cross_14"]]
+        t15 = snapshot[snapshot["cross_15"]]
+
+        a,b,c,d = st.columns(4)
+        a.metric("3개월 중앙값 하락", f"{len(cheaper)}곳")
+        b.metric("12.42억 신규 진입", f"{len(t1242)}곳")
+        c.metric("14억 신규 진입", f"{len(t14)}곳")
+        d.metric("15억 신규 진입", f"{len(t15)}곳")
+
+        if len(cheaper):
+            st.markdown("#### 지난 3개월보다 싸진 곳")
+            show = cheaper[["area","complex_name","m3","prior3","median_change","median_pct","latest","latest_date"]].copy()
+            show.columns = ["생활권","단지","최근3개월 중앙값","직전3개월 중앙값","변화(억)","변화(%)","최신거래","최신계약일"]
+            st.dataframe(show, use_container_width=True, hide_index=True)
+        else:
+            st.caption("최근 3개월 중앙값이 직전 3개월보다 낮아진 후보가 현재 조회되지 않았습니다.")
+
+        entered = pd.concat([
+            t1242.assign(진입선="🎯 12.42억"),
+            t14.assign(진입선="🟡 14억"),
+            t15.assign(진입선="🟠 15억")
+        ], ignore_index=True)
+        if len(entered):
+            st.markdown("#### 이번에 가격선 안으로 들어온 곳")
+            show = entered[["진입선","area","complex_name","previous","latest","latest_change","latest_pct","latest_date"]].copy()
+            show.columns = ["진입선","생활권","단지","직전거래","최신거래","변화(억)","변화(%)","계약일"]
+            st.dataframe(show, use_container_width=True, hide_index=True)
+
+        st.markdown("#### 전체 후보 현재판")
+        region_filter = st.multiselect("권역", ["서울","경기남부"], default=["서울","경기남부"])
+        band_filter = st.multiselect("가격 구간", ["12.42억","14억","15억","15억 초과"],
+                                     default=["12.42억","14억","15억","15억 초과"])
+        view = snapshot[snapshot.region.isin(region_filter) & snapshot.band.isin(band_filter)].copy()
+        view = view.sort_values(["latest","area"])
+        cols = ["region","area","candidate_rank","complex_name","latest","latest_date","m3","prior3","median_pct","count3","count12","band"]
+        st.dataframe(view[cols].rename(columns={
+            "region":"권역","area":"생활권","candidate_rank":"TOP","complex_name":"단지","latest":"최신 실거래(억)",
+            "latest_date":"계약일","m3":"최근3개월 중앙값","prior3":"직전3개월 중앙값",
+            "median_pct":"3개월 변화(%)","count3":"최근3개월 거래","count12":"12개월 거래","band":"현재 가격구간"
+        }), use_container_width=True, hide_index=True)
+        st.caption("‘싸진 곳’은 최근 3개월 중앙값과 직전 3개월 중앙값을 비교합니다. ‘신규 진입’은 직전 거래가 기준선 위였고 최신 거래가 기준선 이하로 내려온 경우입니다.")
+    else:
+        st.info("최신 실거래 스냅샷을 만들 수 없어 초기 검증값을 표시합니다.")
+        view = candidates.merge(seed[["complex_name","low_2026","high_2026"]], on="complex_name", how="left")
+        view["초기대표가"] = (view.low_2026 + view.high_2026)/2
+        view["가격구간"] = view["초기대표가"].apply(budget_band)
+        st.dataframe(view[["region","area","candidate_rank","complex_name","초기대표가","가격구간","households","nearest_station","note"]],
+                     use_container_width=True, hide_index=True)
 
 elif page == "단지 상세":
-    named = candidates[~candidates.complex_name.str.contains("후보", na=False)].copy()
-    selected = st.selectbox("단지를 선택하세요", named.complex_name.tolist())
-    row = named[named.complex_name==selected].iloc[0]
-    st.subheader(f"{selected} · {row['area']}")
+    named = candidates.copy().sort_values(["region","area","candidate_rank"])
+    named["선택표시"] = named.apply(
+        lambda r: f"{r['region']} | {r['area']} | TOP {int(r['candidate_rank'])} | {r['complex_name']}", axis=1)
+    selected_label = st.selectbox("단지를 선택하세요", named["선택표시"].tolist())
+    row = named[named["선택표시"]==selected_label].iloc[0]
+    selected = row["complex_name"]
+    st.subheader(f"TOP {int(row['candidate_rank'])} · {selected} · {row['area']}")
 
     left,right = st.columns([2,1])
     with right:
@@ -175,10 +295,16 @@ elif page == "단지 상세":
         st.write(f"- 권역: **{row['region']} / {row['area']}**")
         st.write(f"- 세대수: **{int(row['households']) if pd.notna(row['households']) else '미입력'}세대**")
         st.write(f"- 준공: **{int(row['build_year']) if pd.notna(row['build_year']) else '미입력'}년**")
-        st.write(f"- 최근역: **{row['nearest_station']} / 도보 약 {row['walk_station_min']}분**")
+        station = row['nearest_station'] if pd.notna(row['nearest_station']) and str(row['nearest_station']).strip() else "검증 예정"
+        walk = f"도보 약 {int(row['walk_station_min'])}분" if pd.notna(row['walk_station_min']) else "도보시간 검증 예정"
+        st.write(f"- 최근역: **{station} / {walk}**")
         st.write(f"- 초등: **{row['elementary_school'] if pd.notna(row['elementary_school']) else '검증 예정'}**")
         st.write(f"- 중등: **{row['middle_school'] if pd.notna(row['middle_school']) else '검증 예정'}**")
-        st.write(f"- 을지로입구 예상 통근: **약 {row['commute_eulji_min']}분**")
+        commute = f"약 {int(row['commute_eulji_min'])}분" if pd.notna(row['commute_eulji_min']) else "검증 예정"
+        st.write(f"- 을지로입구 예상 통근: **{commute}**")
+        st.write(f"- 생활권 내 후보순위: **TOP {int(row['candidate_rank'])}**")
+        if "static_data_status" in row:
+            st.write(f"- 정적조건 검증: **{row['static_data_status']}**")
         if 'screening' in row and pd.notna(row['screening']):
             st.write(f"- 현재 스크리닝: **{row['screening']}**")
         st.info(row['note'])
@@ -190,8 +316,8 @@ elif page == "단지 상세":
 
     trades = pd.DataFrame()
     if api_key:
-        with st.spinner("최근 24개월 실거래를 조회하는 중..."):
-            all_trades = fetch_recent_trades(str(row['lawd_cd']), 24, api_key)
+        with st.spinner("최근 5년 실거래를 조회하는 중..."):
+            all_trades = fetch_recent_trades(str(row['lawd_cd']), 60, api_key)
             api_target = row['api_name'] if 'api_name' in row and pd.notna(row['api_name']) and str(row['api_name']).strip() else selected
             trades = filter_complex(all_trades, api_target)
     summary = trade_summary(trades)
@@ -205,11 +331,21 @@ elif page == "단지 상세":
             b.caption(f"TARGET 대비 {TARGET-summary['latest']:+.2f}억")
             c.metric("최근 3개월 중앙값", f"{summary['m3']:.2f}억" if summary['m3'] else "-")
             d.metric("12개월 거래수", summary['count12'])
+            if summary["previous"] is not None:
+                st.caption(f"직전 거래 {summary['previous']:.2f}억 → 최신 {summary['latest']:.2f}억 "
+                           f"({summary['latest_change']:+.2f}억, {summary['latest_pct']:+.1f}%)")
+            if summary["m3"] is not None and summary["prior3"] is not None:
+                st.caption(f"최근 3개월 중앙값 {summary['m3']:.2f}억 / 직전 3개월 {summary['prior3']:.2f}억 "
+                           f"({summary['median_change']:+.2f}억, {summary['median_pct']:+.1f}%)")
+            if summary["high_5y"]:
+                st.caption(f"조회된 최근 5년 거래 중 최고가 {summary['high_5y']:.2f}억 · 최신 거래는 최고가 대비 "
+                           f"{(summary['latest']/summary['high_5y']-1)*100:+.1f}%")
             plot_df = trades.dropna(subset=["deal_date","price_eok"]).sort_values("deal_date")
             fig = px.scatter(plot_df, x="deal_date", y="price_eok", hover_data=[c for c in ["area_m2","floor"] if c in plot_df.columns],
-                             labels={"deal_date":"계약일","price_eok":"거래가(억원)"}, title="최근 24개월 74~84㎡ 실거래")
-            fig.add_hline(y=TARGET, line_dash="dash", annotation_text="TARGET")
-            fig.add_hline(y=MAX_BUDGET, line_dash="dot", annotation_text="MAX")
+                             labels={"deal_date":"계약일","price_eok":"거래가(억원)"}, title="최근 5년 74~84㎡ 실거래")
+            fig.add_hline(y=TARGET, line_dash="dash", annotation_text="12.42억")
+            fig.add_hline(y=WATCH_14, line_dash="dot", annotation_text="14억")
+            fig.add_hline(y=WATCH_15, line_dash="dashdot", annotation_text="15억")
             st.plotly_chart(fig, use_container_width=True)
             cols = [c for c in ["deal_date","price_eok","area_m2","floor","dong","jibun"] if c in trades.columns]
             st.dataframe(trades[cols].head(30), use_container_width=True, hide_index=True)
@@ -220,7 +356,7 @@ elif page == "단지 상세":
                 mid=(s.low_2026+s.high_2026)/2
                 st.metric("현재 표시값 (초기 검증치)", f"{mid:.2f}억", f"범위 {s.low_2026:.2f}~{s.high_2026:.2f}억")
                 st.write(f"가격판정: **{price_status(mid)}**")
-            st.info("API 인증키를 연결하면 이 자리에 최신 실거래 그래프와 과거 24개월 거래내역이 자동으로 나타납니다.")
+            st.info("API 인증키를 연결하면 이 자리에 최신 실거래 그래프와 최근 5년 거래내역이 자동으로 나타납니다.")
 
 elif page == "지역 비교":
     st.subheader("생활권 비교")
@@ -228,9 +364,9 @@ elif page == "지역 비교":
     comp = candidates[candidates.area.isin(areas)].copy()
     comp = comp.merge(seed[["complex_name","low_2026","high_2026"]], on="complex_name", how="left")
     comp["초기대표가"]=(comp.low_2026+comp.high_2026)/2
-    cols=["region","area","complex_name","초기대표가","households","walk_station_min","nearest_station","commute_eulji_min","priority","screening","note"]
-    st.dataframe(comp[cols].rename(columns={"region":"권역","area":"생활권","complex_name":"대표단지","households":"세대수","walk_station_min":"역도보","nearest_station":"역","commute_eulji_min":"을지로 통근","priority":"우선순위","screening":"스크리닝","note":"메모"}), use_container_width=True, hide_index=True)
-    st.caption("V2에서는 학군·교통·연식·생활편의·가격여유를 가중치로 점수화해 같은 화면에서 순위를 만들 예정입니다.")
+    cols=["region","area","candidate_rank","complex_name","초기대표가","households","walk_station_min","nearest_station","commute_eulji_min","priority","screening","note"]
+    st.dataframe(comp[cols].rename(columns={"region":"권역","area":"생활권","candidate_rank":"TOP","complex_name":"후보단지","households":"세대수","walk_station_min":"역도보","nearest_station":"역","commute_eulji_min":"을지로 통근","priority":"우선순위","screening":"스크리닝","note":"메모"}), use_container_width=True, hide_index=True)
+    st.caption("V1.3부터 생활권별 최대 TOP 5를 비교합니다. 정적조건이 '추가검증'인 단지는 세대수·학교·역거리 데이터를 계속 보강합니다.")
 
 else:
     st.subheader("처음 쓰는 사람용 설정")
